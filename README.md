@@ -26,8 +26,8 @@ Please check the necessary libraries and compatible versions:
 - `pandas 2.2.2`
 - `torch 2.5.1`
 - `scipy 1.15.2`
-- `gurobipy 12.0.3`
 - `pyarrow 15.0.2` or `fastparquet 2025.12.0`: needed for reading .parquet files.
+- `gurobipy 12.0.3`: (optional), only needed for exact benchmark under `Exact (Gurobi)/Exact.py`. 
 - `matplotlib 3.9.1`: (optional), only needed for visualization.
 
 Please use the project root as the working directory on the computer:
