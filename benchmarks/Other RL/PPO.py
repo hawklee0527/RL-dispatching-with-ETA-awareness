@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Two models may be saved by this module: {save_path} is the model with 
-the best recent returns, while {final_path} is the final state of full epochs. 
+Created on Tue May 12 17:07:24 2026
 
-Set {load_dir} to load an existing parameters for the agent. 
+@author: MR
 """
 
 import numpy as np
@@ -11,8 +10,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
-import os
 import time
+from pathlib import Path
 
 
 # ===============================
@@ -72,27 +71,6 @@ class ContextView(nn.Module):
     def forward(self, x):
         return self.net(x)
 
-class CriticRouteView(nn.Module):
-    """ Encode vehicle trajectory features for critic. """
-    def __init__(self, in_dim=2, hidden_dim=64, out_dim=64, drop=0.1):
-        super().__init__()
-        self.lstm = nn.LSTM(input_size=in_dim, hidden_size=hidden_dim,
-                            batch_first=True, bidirectional=False)
-        
-        self.out_head = nn.Sequential(
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.ReLU(),
-                    nn.Dropout(drop),
-                    nn.Linear(hidden_dim, out_dim))
-    
-    def forward(self, padded, lengths):
-        packed = nn.utils.rnn.pack_padded_sequence(
-            padded, lengths.cpu(),
-            batch_first=True, enforce_sorted=False)
-        
-        _, (h,_) = self.lstm(packed)
-        return self.out_head(h[-1])
-
 class Actor(nn.Module):
     """Action: Sampling vehicle selection + ETA"""
     def __init__(self, in_dim=192, hidden1_dim=64, hidden2_dim=64,
@@ -116,35 +94,13 @@ class Actor(nn.Module):
         eta_logits = self.samp_eta_net(fusion_x)                       # (K+1, 3)
         return car_logits, eta_logits
     
-class Critic(nn.Module):
-    """Critic reads full route trajectories and estimates V(s)."""
-    def __init__(self, in_dim=66, hidden_dim=64, drop=0.1):
-        super().__init__()
-        self.critic_view = CriticRouteView()
-        self.critic_head = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(drop),
-            nn.Linear(hidden_dim, 1))
-
-    def forward(self, route_ts, route_lengths, ov, step):
-        route_x = self.critic_view(route_ts, route_lengths) # (K, hidden_dim)
-        state_x = route_x.mean(dim=0)                       # (hidden_dim,)
-        
-        # additionally embed objective value and time step for critic
-        ov_norm = float(ov) / 100.0
-        step_norm = float((step - RH.t0) / (RH.T - RH.t0))
-        scalar_x = torch.tensor([ov_norm, step_norm],
-                         dtype=torch.float32, device=device)  # (2,)
-        state_x = torch.cat([state_x, scalar_x], dim=0)       # (hidden_dim + 2,)
-        return self.critic_head(state_x).squeeze()
 
 # ===============================
 # Instance
 # ===============================
 '''initialize data'''
 class Instance:
-    def __init__(self, path, ins_slice=slice(None), static_version=False):
+    def __init__(self, path, top_n=10):
         data = pd.read_parquet(path)
         # standardize time
         t_base = data['pick_early'].min()
@@ -155,10 +111,8 @@ class Instance:
         # add request's ID and status
         data['id'] = np.arange(len(data), dtype=int)
         data['status'] = True
-        if static_version:  # static version: all requests are initially known 
-            data['pick_early'] = 0
 
-        self.data = data.copy()[ins_slice]
+        self.data = data.copy()
 
 # ===============================
 # Reinforcement Learining
@@ -169,7 +123,9 @@ class Learning(nn.Module):
                  max_episode=1000, γ=0.5, reward_scale=0.01, 
                  τ=1.0, τ_max=10.0, τ_min=0.0, switch_cap=10, off_cap=50, 
                  reject_loss=-5, 
-                 lr_actor=1e-4, lr_critic=1e-4):
+                 lr_actor=1e-4,
+                 ppo_clip=0.2, ppo_epochs=4, ppo_batch_size=64,
+                 entropy_coef=0.0, normalize_advantage=True):
         super().__init__()
         # episodes
         self.episode = 0
@@ -194,7 +150,6 @@ class Learning(nn.Module):
         self.vehicle_view = VehicleView().to(device)
         self.context_view = ContextView().to(device)
         self.actor = Actor().to(device)
-        self.critic = Critic().to(device)
         self.dummy_vehicle_x = nn.Parameter(torch.zeros(1, 64, device=device))
         
         # optimizers
@@ -203,9 +158,7 @@ class Learning(nn.Module):
                              + list(self.context_view.parameters())
                              + list(self.actor.parameters())
                              + [self.dummy_vehicle_x])
-        self.critic_params = list(self.critic.parameters())
         self.actor_opti = torch.optim.Adam(self.actor_params, lr=lr_actor)
-        self.critic_opti = torch.optim.Adam(self.critic_params, lr=lr_critic)
         
         # auximilary parameters
         self.ov_epi = np.full(max_episode, np.nan)
@@ -216,11 +169,17 @@ class Learning(nn.Module):
         self.γ = γ
         self.β = reward_scale
         self.λ = reject_loss
+        self.ppo_clip = ppo_clip
+        self.ppo_epochs = ppo_epochs
+        self.ppo_batch_size = ppo_batch_size
+        self.entropy_coef = entropy_coef
+        self.normalize_advantage = normalize_advantage
+        self.memory = []
         
         # records
         self.ov_best = -np.inf
         self.returns = np.full(self.max_episode, np.nan)
-        self.recent_best = -np.inf; self.recent = 50
+        self.recent_best = -np.inf; self.recent = 20
         self.runtime = 0
         
     def reward_curve(self):
@@ -228,21 +187,12 @@ class Learning(nn.Module):
                  self.episode_ov, color='tab:red')
         plt.show()
         
-    def act(
-        self,
-        req,
-        avail_vehs,
-        debug_plot=False,
-        greedy_sample=False,
-        eta_policy="model",
-        eta_rng=None,
-    ):
+    def act(self, req, avail_vehs, debug_plot=False, greedy_sample=False):
         """ Two-step action:
             1. select vehicle k in {0, ..., K-1} or dummy K;
             2. if real vehicle is selected, select ETA in {0, 1, 2}.
         """
         # value current state value
-        state_value = self.value_state(ov=RH.ov, step=RH.now)
         avail_vehs = list(avail_vehs)
 
         # featurize
@@ -279,25 +229,24 @@ class Learning(nn.Module):
         car_idx = int(car_pos.item())
         log_prob = π_car.log_prob(car_pos)
 
+        transition = {
+            'avail_vehs': avail_vehs,
+            'req_ftrs': req_ftrs,
+            'vehi_padded': vehi_padded.detach().cpu(),
+            'vehi_lengths': vehi_lengths.detach().cpu(),
+            'context_ftrs': context_ftrs,
+            'car_pos': car_idx,
+            'eta_pos': None,
+        }
+
         # dummy vehicle: reject / no dispatch for now
         if car_idx == len(avail_vehs):
-            return car_idx, None, log_prob, state_value
+            transition['old_log_prob'] = float(log_prob.detach().cpu())
+            return car_idx, None, transition
 
-        # sample or override ETA under the selected real vehicle
+        # sample ETA under the selected real vehicle
         π_eta = torch.distributions.Categorical(logits=eta_logits[car_idx])
-        if eta_policy == "model":
-            eta = torch.argmax(eta_logits[car_idx]) if greedy_sample else π_eta.sample()
-        elif eta_policy == "random":
-            rng = eta_rng if eta_rng is not None else np.random.default_rng()
-            eta = torch.tensor(
-                int(rng.integers(3)),
-                dtype=torch.long,
-                device=device,
-            )
-        elif eta_policy in (0, 1, 2, "0", "1", "2"):
-            eta = torch.tensor(int(eta_policy), dtype=torch.long, device=device)
-        else:
-            raise ValueError(f"Unknown eta_policy: {eta_policy}")
+        eta = torch.argmax(eta_logits[car_idx]) if greedy_sample else π_eta.sample()
         log_prob = log_prob + π_eta.log_prob(eta)
 
         if debug_plot and self.epoch % 500 == 0:
@@ -313,7 +262,9 @@ class Learning(nn.Module):
             plt.show()
             plt.close()
             
-        return int(avail_vehs[car_idx]), int(eta.item()), log_prob, state_value
+        transition['eta_pos'] = int(eta.item())
+        transition['old_log_prob'] = float(log_prob.detach().cpu())
+        return int(avail_vehs[car_idx]), int(eta.item()), transition
 
     def reward(self, Δz, is_dummy):
         """Training reward based ARS"""
@@ -322,37 +273,104 @@ class Learning(nn.Module):
         reward = torch.tensor(raw, dtype=torch.float32, device=device)
         return torch.tanh(self.β * reward)
 
-    def update(self, log_prob, state_value, Δov, is_dummy, show=False):
-        '''RL parameters update based on back-propagation'''
-        reward = self.reward(Δov, is_dummy)
+    def _policy_logits(self, req_ftrs, vehi_padded, vehi_lengths, context_ftrs):
+        req_x = torch.as_tensor(req_ftrs, dtype=torch.float32,
+                                device=device).unsqueeze(0)
+        req_x = self.request_view(req_x)
 
-        with torch.no_grad():
-            new_state_value = self.value_state(ov=RH.ov, step=RH.now).detach()
-            target = reward + self.γ * new_state_value
-        advantage = target - state_value
-        
-        # loss function
-        actor_loss = -log_prob * advantage.detach()
-        critic_loss = advantage.pow(2)
-        
-        # back-propagate
-        self.actor_opti.zero_grad()
-        self.critic_opti.zero_grad()
-        actor_loss.backward()
-        critic_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.actor_params, max_norm=1.0)
-        torch.nn.utils.clip_grad_norm_(self.critic_params, max_norm=1.0)
-        self.actor_opti.step()
-        self.critic_opti.step()
-        self.epoch += 1
+        vehi_padded = vehi_padded.to(device)
+        vehi_lengths = vehi_lengths.to(device)
+        real_vehi_x = self.vehicle_view(vehi_padded, vehi_lengths)
+        vehi_x = torch.cat([real_vehi_x, self.dummy_vehicle_x], dim=0)
+
+        context_x = torch.as_tensor(context_ftrs, dtype=torch.float32,
+                                    device=device)
+        context_x = self.context_view(context_x)
+
+        fusion_x = torch.cat([
+            req_x.expand(vehi_x.size(0), -1),
+            vehi_x,
+            context_x], dim=1)
+        return self.actor(fusion_x)
+
+    def _transition_log_prob_entropy(self, transition):
+        car_logits, eta_logits = self._policy_logits(
+            transition['req_ftrs'],
+            transition['vehi_padded'],
+            transition['vehi_lengths'],
+            transition['context_ftrs'])
+
+        car_dist = torch.distributions.Categorical(logits=car_logits)
+        car_pos = torch.tensor(transition['car_pos'], dtype=torch.long,
+                               device=device)
+        log_prob = car_dist.log_prob(car_pos)
+        entropy = car_dist.entropy()
+
+        eta_pos = transition['eta_pos']
+        if eta_pos is not None:
+            eta_dist = torch.distributions.Categorical(
+                logits=eta_logits[transition['car_pos']])
+            eta_pos = torch.tensor(eta_pos, dtype=torch.long, device=device)
+            log_prob = log_prob + eta_dist.log_prob(eta_pos)
+            entropy = entropy + eta_dist.entropy()
+
+        return log_prob, entropy
+
+    def update(self, transition, delta_ov, is_dummy, show=False):
+        '''Collect one transition; PPO updates on mini rollouts.'''
+        reward = self.reward(delta_ov, is_dummy)
+        transition['reward'] = float(reward.detach().cpu())
+        self.memory.append(transition)
+
+        if len(self.memory) >= self.ppo_batch_size:
+            self.ppo_update(show=show)
+
+    def ppo_update(self, show=False):
+        if len(self.memory) == 0:
+            return
+
+        rewards = torch.tensor([item['reward'] for item in self.memory],
+                               dtype=torch.float32, device=device)
+        advantages = rewards
+        if self.normalize_advantage and len(self.memory) > 1:
+            advantages = (advantages - advantages.mean()) / (
+                advantages.std(unbiased=False) + 1e-8)
+
+        old_log_probs = torch.tensor(
+            [item['old_log_prob'] for item in self.memory],
+            dtype=torch.float32, device=device)
+
+        last_loss = None
+        for _ in range(self.ppo_epochs):
+            losses = []
+            entropies = []
+            for idx, transition in enumerate(self.memory):
+                log_prob, entropy = self._transition_log_prob_entropy(transition)
+                ratio = torch.exp(log_prob - old_log_probs[idx])
+                clipped_ratio = torch.clamp(
+                    ratio, 1.0 - self.ppo_clip, 1.0 + self.ppo_clip)
+                surrogate = torch.min(
+                    ratio * advantages[idx],
+                    clipped_ratio * advantages[idx])
+                losses.append(-surrogate)
+                entropies.append(entropy)
+
+            actor_loss = torch.stack(losses).mean()
+            entropy_bonus = torch.stack(entropies).mean()
+            loss = actor_loss - self.entropy_coef * entropy_bonus
+
+            self.actor_opti.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.actor_params, max_norm=1.0)
+            self.actor_opti.step()
+            self.epoch += 1
+            last_loss = float(loss.detach().cpu())
 
         if show:
             print(f'Epoch: {self.epoch}')
-            print(f'Raw Δov: {Δov:.3f}; reward: {reward:.3f}')
+            print(f'PPO batch size: {len(self.memory)} | loss: {last_loss:.4f}')
 
-    def value_state(self, ov, step):
-        route_padded, route_lengths = self.featurize_route(from_head=False)
-        return self.critic(route_padded, route_lengths, ov, step)
+        self.memory.clear()
 
     def featurize_route(self, from_head=False):
         ftrs = []
@@ -490,25 +508,27 @@ class Learning(nn.Module):
         return np.asarray(ftrs, dtype=np.float32)
 
     def save_model(self, save_path, backup=False):
-        '''save critical model parameters'''
+        '''save crucial model parameters'''
         save = {
             # neural networks
             'request_view': self.request_view.state_dict(),
             'vehicle_view': self.vehicle_view.state_dict(),
             'context_view': self.context_view.state_dict(),
             'actor': self.actor.state_dict(),
-            'critic': self.critic.state_dict(),
             'dummy_vehicle_x': self.dummy_vehicle_x.detach().cpu(),
             
             # optimizers
             'actor_opti': self.actor_opti.state_dict(),
-            'critic_opti': self.critic_opti.state_dict(), 
 
             # records
             'steps': steps, 
             'episode': self.episode, 
             'returns': self.returns, 
-            'runtime': self.runtime}
+            'runtime': self.runtime,
+            'ppo_clip': self.ppo_clip,
+            'ppo_epochs': self.ppo_epochs,
+            'ppo_batch_size': self.ppo_batch_size,
+            'entropy_coef': self.entropy_coef}
         
         torch.save(save, save_path)
         torch.save(save, save_path.replace('.pth', '_bkp.pth'))
@@ -519,17 +539,14 @@ class Learning(nn.Module):
         
         '''load model parameters'''
         params = torch.load(load_path, map_location=device, weights_only=False)
-        
         # load model parameters
         self.request_view.load_state_dict(params['request_view'])
         self.vehicle_view.load_state_dict(params['vehicle_view'])
         self.context_view.load_state_dict(params['context_view'])
         self.actor.load_state_dict(params['actor'])
-        self.critic.load_state_dict(params['critic'])
         self.dummy_vehicle_x.data.copy_(params['dummy_vehicle_x'].to(device))
         
         self.actor_opti.load_state_dict(params['actor_opti'])
-        self.critic_opti.load_state_dict(params['critic_opti'])
         
         
     def ARS_temperature_control(self):
@@ -555,8 +572,7 @@ class Learning(nn.Module):
             self.temp_fail = 0
             self.heat_coef = (self.τ_max - self.τ_min) / self.episode
             
-    def train(self, data, save_path=None, early_breaking=True, 
-              tolerance=250, per_epis_depict=1000):
+    def train(self, data, early_breaking=True, tolerance=250, per_epis_depict=1000):
         recent_fail = 0
         start = time.time()
         for episode in range(self.max_episode): # do an episode
@@ -583,6 +599,7 @@ class Learning(nn.Module):
             else:
                 recent_mean = -np.inf
             
+            print(f'Instance [{inst.replace(".parquet", "")}] {inst_idx + 1}/{len(insts)}')
             print(f'Episode {self.episode}/{self.max_episode}  Temperature {self.τ:.2f}')
             print(f'Incumbent/Best ov [{ov_epi:.3f} / {self.ov_best:.3f}]')
             print(f'recent {self.recent} average: {recent_mean:.3f}')
@@ -604,9 +621,8 @@ class Learning(nn.Module):
             if recent_mean > self.recent_best:
                 self.recent_best = recent_mean
                 end = time.time(); self.runtime = end - start
-                if save_path is not None:
-                    self.save_model(save_path=save_path, 
-                                    backup=False)  # save the best recent model
+                self.save_model(save_path=save_path, 
+                                backup=False)  # save the best recent model
                 recent_fail = 0
             else:
                 recent_fail += 1
@@ -618,27 +634,21 @@ class Learning(nn.Module):
         end = time.time()
         self.runtime += end - start
         
-    def evaluate(self, data, trys=1, greedy_sample=False, eta_policy="model", eta_seed=None):
+    def evaluate(self, data, trys=1, greedy_sample=False):
         '''evaluate model with several trys'''
         returns = np.full(trys, np.nan)
         self.request_view.eval(); self.vehicle_view.eval(); self.context_view.eval()
-        self.actor.eval(); self.critic.eval()
+        self.actor.eval()
         
         for i in range(trys):    # an evaluation
             global RH
-            eta_rng = np.random.default_rng(eta_seed)
             RH = RollingHorizon(self, data, vehi_depot, steps=steps) 
-            ov_i = RH.main(
-                train=False,
-                greedy_sample=greedy_sample,
-                eta_policy=eta_policy,
-                eta_rng=eta_rng,
-            )
+            ov_i = RH.main(train=False, greedy_sample=greedy_sample)
             returns[i] = ov_i
         return returns
 
         self.request_view.train(); self.vehicle_view.train(); self.context_view.train()
-        self.actor.train(); self.critic.train()
+        self.actor.train()
 
 # ===============================
 # Dynamic Rolling Horizon Model
@@ -666,7 +676,7 @@ class RollingHorizon():
         self.heads = np.zeros(K, dtype=int)  # heads of vehicle availale node
         self.ov = 0.0
     
-    def main(self, train=True, greedy_sample=False, eta_policy="model", eta_rng=None): 
+    def main(self, train=True, greedy_sample=False): 
         '''rolling horizon'''
         while self.now <= self.T:
             self.time_pass()   # solution end's time is adjusted to now 
@@ -678,21 +688,18 @@ class RollingHorizon():
                 if len(avail_vehs) == 0:
                     break
                 
-                car_idx, eta, log_prob, state_value = self.RL.act(
-                    req,
-                    range(K),
-                    greedy_sample=greedy_sample,
-                    eta_policy=eta_policy,
-                    eta_rng=eta_rng,
-                )
+                car_idx, eta, transition = self.RL.act(
+                    req, range(K), greedy_sample=greedy_sample)
                 is_dummy = True if car_idx == K else False
                 applied, Δov = self.apply(req, car_idx, eta, is_dummy=is_dummy)
                 self.update_heads()
 
                 # back propagation
                 if train:
-                    self.RL.update(log_prob, state_value, Δov, is_dummy=is_dummy)
+                    self.RL.update(transition, Δov, is_dummy=is_dummy)
             self.now += self.Δt  
+        if train:
+            self.RL.ppo_update()
         return self.ov
     
     def get_time_tonext_available(self):
@@ -706,7 +713,7 @@ class RollingHorizon():
         avail_vehs = np.arange(K)[time_arr <= self.now]
         return time_arr, avail_vehs
     
-    def time_pass(self): # !!!!!
+    def time_pass(self):
         '''solution end's time is adjusted to now if it's earlier'''
         for k, route in enumerate(self.sol):
             end_time = route[-1,2]
@@ -910,32 +917,35 @@ vehi_depot = {k:-((k%len(depots)) + 1) for k in range(K)}  # vehicle depot
 
 # ETA-impact factor matrix
 # ETA → early, on-time, late    
-reward_coefs = np.array([  # ATA ↓
-    [0.2, 0.10, 0.05],     # early arrival
-    [-0.15, 0.0, -0.15],   # on-time arrival
-    [-0.2, -0.10, -0.05]   # late arrival
+reward_coefs = np.array([ # ATA ↓
+    [0.2, 0.10, 0.05],    # early arrival
+    [-0.15, 0.0, -0.15],    # on-time arrival
+    [-0.2, -0.10, -0.05]  # late arrival
 ])
 
 
 # ===============================
-# Path & Main Module
+# Paths
 # ===============================
 
-inst_path = 'data/Training/VS-size/VS_a01.parquet' 
-save_path = 'asset/example.pth'      
-final_path = 'asset/example_final.pth'            
-load_path = None
+ROOT_DIR = Path(__file__).resolve().parents[2]
+inst_dir = ROOT_DIR / 'data' / 'Training' / 'VS-size'
+save_dir = ROOT_DIR / 'asset'
+insts = sorted(inst_dir.glob('*.parquet'))
+print(insts)
 
-def main(max_episode=2000, inst_path=inst_path, save_path=save_path, 
-         final_path=final_path, load_path=load_path):        
-    
-    ins = Instance(inst_path)
-    RL = Learning(max_episode=max_episode, γ=0.5, reward_scale=0.01, 
-                  τ=1.0, τ_max=10.0, τ_min=0.0, 
-                  lr_actor=1e-4, lr_critic=1e-4)
-    RL.load_model(load_path=load_path)
-    RL.train(data=ins.data, save_path=save_path, early_breaking=False)
-    RL.save_model(save_path=final_path, backup=False) 
 
 if __name__ == '__main__':
-    main()
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    for inst_idx, inst_path in enumerate(insts):  # patch training instances in dataset
+        # RL save & load paths
+        save_path = str(save_dir / inst_path.name.replace('.parquet', '_PPO.pth'))
+
+        ins = Instance(inst_path)
+        RL = Learning(max_episode=5000, γ=0.5, reward_scale=0.01, 
+                      τ=1.0, τ_max=10.0, τ_min=0.0, reject_loss=-10, 
+                      lr_actor=1e-4, ppo_clip=0.2, ppo_epochs=4,
+                      ppo_batch_size=64, entropy_coef=0.0)
+        RL.train(data=ins.data, early_breaking=False)
+        RL.save_model(save_path=save_path, backup=True)

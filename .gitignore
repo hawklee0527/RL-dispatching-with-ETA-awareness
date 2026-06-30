@@ -1,16 +1,23 @@
-# Ignore everything by default
 *
 
-# Keep source code
-!src/
-!src/**
-
-# Keep project metadata
-!README.md
 !.gitignore
-!requirements.txt
+!README.md
 
-# Python cache
-__pycache__/
-*.pyc
-*.pyo
+!asset/
+!asset/**
+
+!benchmarks/
+!benchmarks/**/
+!benchmarks/**/*.py
+
+!data/
+!data/Training/
+!data/Training/*-size/
+!data/Training/*-size/**
+!data/Test/
+!data/Test/*-size/
+!data/Test/*-size/**
+
+!src/
+!src/training.py
+!src/test.py
